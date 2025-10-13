@@ -19,6 +19,7 @@
     "fs": "^0.0.1-security",
     "nodemailer": "^7.0.9",
     "openai": "^6.3.0",
+    "pg": "^8.16.3",
     "react-router-dom": "^7.9.3",
     "uuid": "^13.0.0"
   }

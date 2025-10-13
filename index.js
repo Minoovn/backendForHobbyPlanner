@@ -11,7 +11,7 @@ app.use(cors());
 app.use(express.json());
 
 // --------------------
-// PostgreSQL setup (Azure Flexible Server friendly)
+// PostgreSQL setupد (Azure Flexible Server friendly)
 // --------------------
 const pool = new Pool({
   host: process.env.PGHOST,
