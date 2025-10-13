@@ -48,10 +48,10 @@ const transporter = nodemailer.createTransport({
 // --------------------
 // OpenAI Setup
 // --------------------
-const OpenAI = require("openai");
+/*const OpenAI = require("openai");
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-});
+});*/
 
 // --------------------
 // Ensure tables exist (runs at startup)
@@ -407,7 +407,7 @@ app.delete('/sessions/manage/:managementCode', async (req, res) => {
 // --------------------
 // AI-powered session description
 // --------------------
-app.post("/api/suggest-session", async (req, res) => {
+/*app.post("/api/suggest-session", async (req, res) => {
   try {
     const { prompt } = req.body;
     console.log("API Key:", process.env.OPENAI_API_KEY ? "✅ exists" : "❌ missing");
@@ -430,7 +430,7 @@ app.post("/api/suggest-session", async (req, res) => {
     console.error('OpenAI error:', error);
     res.status(500).json({ error: "Failed to generate suggestion" });
   }
-});
+});*/
 
 // --------------------
 // Start server
