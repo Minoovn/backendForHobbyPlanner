@@ -1,8 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 const nodemailer = require('nodemailer');
 const dotenv = require("dotenv");
 dotenv.config();
@@ -10,83 +10,82 @@ dotenv.config();
 app.use(cors());
 app.use(express.json());
 
+// --------------------
+// PostgreSQL setup (Azure Flexible Server friendly)
+// --------------------
+const pool = new Pool({
+  host: process.env.PGHOST,
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  database: process.env.PGDATABASE,
+  port: process.env.PGPORT ? Number(process.env.PGPORT) : 5432,
+  ssl: { rejectUnauthorized: false } // Azure معمولاً SSL نیاز داره
+});
+
+// helper: run a query and log error
+async function runQuery(query, params = []) {
+  try {
+    return await pool.query(query, params);
+  } catch (err) {
+    console.error('Database query error:', err, query, params);
+    throw err;
+  }
+}
 
 // --------------------
 // Nodemailer transporter
 // --------------------
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
-  port: 587, // 🔹 از 465 به 587 تغییر داده شد
-  secure: false, // 🔹 TLS خودش فعال میشه
+  port: 587,
+  secure: false,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS
   }
 });
 
-
-//...............
-//َ OpenAI Setup
-//...............
+// --------------------
+// OpenAI Setup
+// --------------------
 const OpenAI = require("openai");
-
-
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
 // --------------------
-// Initialize database
+// Ensure tables exist (runs at startup)
 // --------------------
-const db = new Database('sessions.db');
-//db.prepare('ALTER TABLE sessions ADD COLUMN email TEXT').run();
-//console.log('✅ Added email column to sessions table');
+async function ensureTables() {
+  // sessions table
+  await runQuery(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id SERIAL PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      date TEXT NOT NULL,
+      time TEXT NOT NULL,
+      maxParticipants INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      managementCode TEXT NOT NULL,
+      createdAt TIMESTAMP NOT NULL,
+      latitude REAL,
+      longitude REAL,
+      email TEXT
+    );
+  `);
 
-
-
-// Check existing tables
-const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-console.log('Tables in sessions.db:', tables);
-
-// Create sessions table if not exists
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    date TEXT NOT NULL,
-    time TEXT NOT NULL,
-    maxParticipants TEXT NOT NULL,
-    type TEXT NOT NULL,
-    managementCode TEXT NOT NULL,
-    createdAt TEXT NOT NULL
-  )
-`);
-
-// Create attendees table
-db.exec(`
-  CREATE TABLE IF NOT EXISTS attendees (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    sessionId INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    email TEXT NOT NULL,
-    registeredAt TEXT NOT NULL,
-    attendanceCode TEXT NOT NULL,
-    FOREIGN KEY (sessionId) REFERENCES sessions(id) ON DELETE CASCADE
-  )
-`);
-
-// ✅ Safely add latitude & longitude columns if they don't exist
-const tableInfo = db.prepare("PRAGMA table_info(sessions)").all();
-const colNames = tableInfo.map(c => c.name);
-
-if (!colNames.includes('latitude')) {
-  db.prepare('ALTER TABLE sessions ADD COLUMN latitude REAL').run();
-  console.log('Added column: latitude');
-}
-if (!colNames.includes('longitude')) {
-  db.prepare('ALTER TABLE sessions ADD COLUMN longitude REAL').run();
-  console.log('Added column: longitude');
+  // attendees table
+  await runQuery(`
+    CREATE TABLE IF NOT EXISTS attendees (
+      id SERIAL PRIMARY KEY,
+      sessionId INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      email TEXT NOT NULL,
+      registeredAt TIMESTAMP NOT NULL,
+      attendanceCode TEXT NOT NULL
+    );
+  `);
 }
 
 // --------------------
@@ -95,23 +94,28 @@ if (!colNames.includes('longitude')) {
 
 // Hello
 app.get('/', (req, res) => {
-  res.send('Hello from hobby planner!');
+  res.send('Hello from hobby planner (Postgres version)!');
 });
 
 // Get all sessions
-app.get('/sessions', (req, res) => {
+app.get('/sessions', async (req, res) => {
   try {
-    const sessions = db.prepare('SELECT * FROM sessions').all();
-    const parsedSessions = sessions.map((session) => {
-      const currentCount = db.prepare('SELECT COUNT(*) as total FROM attendees WHERE sessionId = ?').get(session.id).total;
+    const result = await runQuery('SELECT * FROM sessions ORDER BY id DESC');
+    const sessions = result.rows;
+
+    const parsedSessions = await Promise.all(sessions.map(async (session) => {
+      const countResult = await runQuery('SELECT COUNT(*) FROM attendees WHERE sessionId = $1', [session.id]);
+      const currentCount = parseInt(countResult.rows[0].count, 10);
+
       return {
         ...session,
-        maxParticipants: Number(JSON.parse(session.maxParticipants)),
+        maxParticipants: Number(session.maxparticipants),
         currentParticipants: Number(currentCount),
         latitude: session.latitude,
         longitude: session.longitude
       };
-    });
+    }));
+
     res.json(parsedSessions);
   } catch (err) {
     console.error('Error fetching sessions:', err);
@@ -120,62 +124,76 @@ app.get('/sessions', (req, res) => {
 });
 
 // Get session by ID
-app.get('/sessions/:id', (req, res) => {
-  const id = parseInt(req.params.id);
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id);
+app.get('/sessions/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const result = await runQuery('SELECT * FROM sessions WHERE id = $1', [id]);
+    const session = result.rows[0];
 
-  if (session) {
-    res.json({
-      ...session,
-      maxParticipants: Number(JSON.parse(session.maxParticipants)),
-      latitude: session.latitude,
-      longitude: session.longitude
-    });
-  } else {
-    res.status(404).json({ error: 'Session not found' });
+    if (session) {
+      res.json({
+        ...session,
+        maxParticipants: Number(session.maxparticipants),
+        latitude: session.latitude,
+        longitude: session.longitude
+      });
+    } else {
+      res.status(404).json({ error: 'Session not found' });
+    }
+  } catch (err) {
+    console.error('Error in GET /sessions/:id', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Create a new session
-app.post('/sessions', (req, res) => {
+app.post('/sessions', async (req, res) => {
   try {
     const { title, description, date, time, maxParticipants, type, managementCode, latitude, longitude, email } = req.body;
     const createdAt = new Date().toISOString();
 
-    const stmt = db.prepare(`
-      INSERT INTO sessions (title, description, date, time, maxParticipants, type, managementCode, createdAt, latitude, longitude, email)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    const info = stmt.run(
+    const insertQuery = `
+      INSERT INTO sessions
+      (title, description, date, time, maxParticipants, type, managementCode, createdAt, latitude, longitude, email)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      RETURNING *
+    `;
+    const values = [
       title,
       description,
       date,
       time,
-      JSON.stringify(maxParticipants),
+      Number(maxParticipants) || 0,
       type,
       managementCode,
       createdAt,
       latitude ?? null,
       longitude ?? null,
-      email
-    );
-    
+      email ?? null
+    ];
 
-    // ✉️ بعد از ساخت جلسه، ایمیل ارسال کن
-    const manageLink = `http://localhost:5173/manage-session/${managementCode}`;
+    const newSessionResult = await runQuery(insertQuery, values);
+    const newSession = newSessionResult.rows[0];
 
-    transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: 'Your Hobby Session Management Link',
-      text: `Hi!\n\nYour session "${title}" was created successfully.\n\nManage it here:\n${manageLink}\n\nKeep this link safe.`,
-    });
+    // Send management email (non-blocking: but we'll await to report status)
+    if (email) {
+      const manageLink = `http://localhost:5173/manage-session/${managementCode}`;
+      try {
+        await transporter.sendMail({
+          from: process.env.EMAIL_USER,
+          to: email,
+          subject: 'Your Hobby Session Management Link',
+          text: `Hi!\n\nYour session "${title}" was created successfully.\n\nManage it here:\n${manageLink}\n\nKeep this link safe.`,
+        });
+      } catch (mailErr) {
+        console.error('Error sending management email:', mailErr);
+        // continue - we still return created session
+      }
+    }
 
-
-    const newSession = db.prepare('SELECT * FROM sessions WHERE id = ?').get(info.lastInsertRowid);
     res.status(201).json({
       ...newSession,
-      maxParticipants: Number(JSON.parse(newSession.maxParticipants))
+      maxParticipants: Number(newSession.maxparticipants)
     });
   } catch (err) {
     console.error('Error creating session:', err);
@@ -189,49 +207,54 @@ app.post('/sessions/:id/attendees', async (req, res) => {
   const { firstName, lastName, email } = req.body;
 
   try {
-    // ✅ Get session
-    const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(sessionId);
+    // Get session
+    const sessionResult = await runQuery('SELECT * FROM sessions WHERE id = $1', [sessionId]);
+    const session = sessionResult.rows[0];
     if (!session) return res.status(404).json({ error: 'Session not found' });
 
-    // ✅ Check if session is full
-    const attendeeCount = db.prepare('SELECT COUNT(*) as total FROM attendees WHERE sessionId = ?').get(sessionId).total;
-    if (attendeeCount >= Number(session.maxParticipants)) {
+    // Check if session is full
+    const countResult = await runQuery('SELECT COUNT(*) FROM attendees WHERE sessionId = $1', [sessionId]);
+    const attendeeCount = parseInt(countResult.rows[0].count, 10);
+    if (attendeeCount >= Number(session.maxparticipants)) {
       return res.status(400).json({ error: 'Session is full' });
     }
 
-    // ✅ Create attendee
+    // Create attendee
     const attendanceCode = Math.random().toString(36).substring(2, 10);
     const registeredAt = new Date().toISOString();
-    db.prepare(`
-      INSERT INTO attendees (sessionId, name, email, registeredAt, attendanceCode)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(sessionId, `${firstName} ${lastName}`, email, registeredAt, attendanceCode);
+    await runQuery(
+      'INSERT INTO attendees (sessionId, name, email, registeredAt, attendanceCode) VALUES ($1,$2,$3,$4,$5)',
+      [sessionId, `${firstName} ${lastName}`, email, registeredAt, attendanceCode]
+    );
 
-    // ✅ Send session link email
-    const sessionLink = `http://localhost:5173/attendee/${attendanceCode}`;
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: email,
-      subject: `Your session: ${session.title}`,
-      text: `Hi ${firstName} ${lastName},\n\nHere is your session link:\n${sessionLink}\n\nSee you there!`,
-      html: `<p>Hi ${firstName} ${lastName},</p>
-             <p>Here is your session link: <a href="${sessionLink}">${sessionLink}</a></p>
-             <p>See you there!</p>`
-    };
+    // Send session link email
+    if (email) {
+      const sessionLink = `http://localhost:5173/attendee/${attendanceCode}`;
+      const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: `Your session: ${session.title}`,
+        text: `Hi ${firstName} ${lastName},\n\nHere is your session link:\n${sessionLink}\n\nSee you there!`,
+        html: `<p>Hi ${firstName} ${lastName},</p>
+               <p>Here is your session link: <a href="${sessionLink}">${sessionLink}</a></p>
+               <p>See you there!</p>`
+      };
 
-    transporter.sendMail(mailOptions, (err, info) => {
-      if (err) {
+      try {
+        const info = await transporter.sendMail(mailOptions);
+        console.log('✅ Email sent:', info.response);
+        return res.status(201).json({ message: 'You are now attending the session! Email sent successfully.', attendanceCode });
+      } catch (err) {
         console.error('❌ Error sending email:', err);
-        // حتی اگر ایمیل ارسال نشد، کاربر ثبت شده
         return res.status(201).json({
           message: 'You are now attending the session! But email failed to send.',
           attendanceCode
         });
       }
-
-      console.log('✅ Email sent:', info.response);
-      res.status(201).json({ message: 'You are now attending the session! Email sent successfully.', attendanceCode });
-    });
+    } else {
+      // No email provided
+      return res.status(201).json({ message: 'You are now attending the session!', attendanceCode });
+    }
 
   } catch (err) {
     console.error('Error in /sessions/:id/attendees:', err);
@@ -239,115 +262,147 @@ app.post('/sessions/:id/attendees', async (req, res) => {
   }
 });
 
-
 // Get all attendees for a session
-app.get('/sessions/:id/attendees', (req, res) => {
-  const sessionId = parseInt(req.params.id);
-  const attendees = db.prepare('SELECT * FROM attendees WHERE sessionId = ?').all(sessionId);
-  res.json(attendees);
+app.get('/sessions/:id/attendees', async (req, res) => {
+  try {
+    const sessionId = parseInt(req.params.id);
+    const attendeesResult = await runQuery('SELECT * FROM attendees WHERE sessionId = $1', [sessionId]);
+    res.json(attendeesResult.rows);
+  } catch (err) {
+    console.error('Error in GET /sessions/:id/attendees', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Delete an attendee by attendanceCode
-app.delete('/attendees/:code', (req, res) => {
-  const { code } = req.params;
-  const info = db.prepare('DELETE FROM attendees WHERE attendanceCode = ?').run(code);
+app.delete('/attendees/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const info = await runQuery('DELETE FROM attendees WHERE attendanceCode = $1 RETURNING *', [code]);
 
-  if (info.changes === 0) return res.status(404).json({ error: 'Invalid attendance code' });
-  res.json({ message: 'You have left the session' });
+    if (info.rowCount === 0) return res.status(404).json({ error: 'Invalid attendance code' });
+    res.json({ message: 'You have left the session' });
+  } catch (err) {
+    console.error('Error deleting attendee:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // --------------------
 // Attendee details
 // --------------------
-app.get('/attendees/:code', (req, res) => {
-  const { code } = req.params;
-  const attendee = db.prepare('SELECT * FROM attendees WHERE attendanceCode = ?').get(code);
-  if (!attendee) return res.status(404).json({ error: 'Attendee not found' });
-  res.json({ name: attendee.name, email: attendee.email,  sessionId: attendee.sessionId  });
+app.get('/attendees/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const att = await runQuery('SELECT * FROM attendees WHERE attendanceCode = $1', [code]);
+    const attendee = att.rows[0];
+    if (!attendee) return res.status(404).json({ error: 'Attendee not found' });
+    res.json({ name: attendee.name, email: attendee.email, sessionId: attendee.sessionid });
+  } catch (err) {
+    console.error('Error in GET /attendees/:code', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-app.put('/attendees/:code', (req, res) => {
-  const { code } = req.params;
-  const { name, email } = req.body;
-  const attendee = db.prepare('SELECT * FROM attendees WHERE attendanceCode = ?').get(code);
-  if (!attendee) return res.status(404).json({ error: 'Attendee not found' });
+app.put('/attendees/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    const { name, email } = req.body;
+    const att = await runQuery('SELECT * FROM attendees WHERE attendanceCode = $1', [code]);
+    const attendee = att.rows[0];
+    if (!attendee) return res.status(404).json({ error: 'Attendee not found' });
 
-  db.prepare('UPDATE attendees SET name = ?, email = ? WHERE attendanceCode = ?')
-    .run(name, email, code);
-
-  res.json({ message: 'Attendee info updated successfully' });
+    await runQuery('UPDATE attendees SET name = $1, email = $2 WHERE attendanceCode = $3', [name, email, code]);
+    res.json({ message: 'Attendee info updated successfully' });
+  } catch (err) {
+    console.error('Error in PUT /attendees/:code', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // --------------------
 // Management routes
 // --------------------
-app.get('/sessions/manage/:managementCode', (req, res) => {
-  const { managementCode } = req.params;
-  const session = db.prepare('SELECT * FROM sessions WHERE managementCode = ?').get(managementCode);
+app.get('/sessions/manage/:managementCode', async (req, res) => {
+  try {
+    const { managementCode } = req.params;
+    const result = await runQuery('SELECT * FROM sessions WHERE managementCode = $1', [managementCode]);
+    const session = result.rows[0];
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  if (!session) return res.status(404).json({ error: 'Session not found' });
-
-  res.json({
-    ...session,
-    maxParticipants: Number(JSON.parse(session.maxParticipants)),
-    latitude: session.latitude,
-    longitude: session.longitude
-  });
+    res.json({
+      ...session,
+      maxParticipants: Number(session.maxparticipants),
+      latitude: session.latitude,
+      longitude: session.longitude
+    });
+  } catch (err) {
+    console.error('Error in GET /sessions/manage/:managementCode', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-app.get('/sessions/manage/:managementCode/attendees', (req, res) => {
-  const { managementCode } = req.params;
-  const session = db.prepare('SELECT * FROM sessions WHERE managementCode = ?').get(managementCode);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
+app.get('/sessions/manage/:managementCode/attendees', async (req, res) => {
+  try {
+    const { managementCode } = req.params;
+    const sessionRes = await runQuery('SELECT * FROM sessions WHERE managementCode = $1', [managementCode]);
+    const session = sessionRes.rows[0];
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  const attendees = db.prepare('SELECT * FROM attendees WHERE sessionId = ?').all(session.id);
-  res.json(attendees);
+    const attendees = await runQuery('SELECT * FROM attendees WHERE sessionId = $1', [session.id]);
+    res.json(attendees.rows);
+  } catch (err) {
+    console.error('Error in GET /sessions/manage/:managementCode/attendees', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// ✅ Update session (with map support)
-app.put('/sessions/manage/:managementCode', (req, res) => {
-  const { managementCode } = req.params;
-  const { title, description, date, time, maxParticipants, type, latitude, longitude } = req.body;
+// Update session (with map support)
+app.put('/sessions/manage/:managementCode', async (req, res) => {
+  try {
+    const { managementCode } = req.params;
+    const { title, description, date, time, maxParticipants, type, latitude, longitude } = req.body;
 
-  const session = db.prepare('SELECT * FROM sessions WHERE managementCode = ?').get(managementCode);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
+    const sessionRes = await runQuery('SELECT * FROM sessions WHERE managementCode = $1', [managementCode]);
+    const session = sessionRes.rows[0];
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  db.prepare(`
-    UPDATE sessions
-    SET title = ?, description = ?, date = ?, time = ?, maxParticipants = ?, type = ?, latitude = ?, longitude = ?
-    WHERE managementCode = ?
-  `).run(
-    title,
-    description,
-    date,
-    time,
-    JSON.stringify(maxParticipants),
-    type,
-    latitude ?? null,
-    longitude ?? null,
-    managementCode
-  );
+    await runQuery(
+      `UPDATE sessions
+       SET title = $1, description = $2, date = $3, time = $4, maxParticipants = $5, type = $6, latitude = $7, longitude = $8
+       WHERE managementCode = $9`,
+      [title, description, date, time, Number(maxParticipants) || 0, type, latitude ?? null, longitude ?? null, managementCode]
+    );
 
-  const updatedSession = db.prepare('SELECT * FROM sessions WHERE managementCode = ?').get(managementCode);
-  res.json({
-    ...updatedSession,
-    maxParticipants: Number(JSON.parse(updatedSession.maxParticipants))
-  });
+    const updated = await runQuery('SELECT * FROM sessions WHERE managementCode = $1', [managementCode]);
+    const updatedSession = updated.rows[0];
+    res.json({
+      ...updatedSession,
+      maxParticipants: Number(updatedSession.maxparticipants)
+    });
+  } catch (err) {
+    console.error('Error in PUT /sessions/manage/:managementCode', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Delete session
-app.delete('/sessions/manage/:managementCode', (req, res) => {
-  const { managementCode } = req.params;
-  const session = db.prepare('SELECT * FROM sessions WHERE managementCode = ?').get(managementCode);
-  if (!session) return res.status(404).json({ error: 'Session not found' });
+app.delete('/sessions/manage/:managementCode', async (req, res) => {
+  try {
+    const { managementCode } = req.params;
+    const sessionRes = await runQuery('SELECT * FROM sessions WHERE managementCode = $1', [managementCode]);
+    const session = sessionRes.rows[0];
+    if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  db.prepare('DELETE FROM sessions WHERE managementCode = ?').run(managementCode);
-  db.prepare('DELETE FROM attendees WHERE sessionId = ?').run(session.id);
+    await runQuery('DELETE FROM attendees WHERE sessionId = $1', [session.id]);
+    await runQuery('DELETE FROM sessions WHERE managementCode = $1', [managementCode]);
 
-  res.json({ message: 'Session deleted successfully' });
+    res.json({ message: 'Session deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting session:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
-
-
 
 // --------------------
 // AI-powered session description
@@ -358,6 +413,7 @@ app.post("/api/suggest-session", async (req, res) => {
     console.log("API Key:", process.env.OPENAI_API_KEY ? "✅ exists" : "❌ missing");
     console.log("Received prompt:", prompt);
 
+    // using same style as your previous code - chat completions
     const response = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
       messages: [
@@ -371,25 +427,30 @@ app.post("/api/suggest-session", async (req, res) => {
     res.json({ suggestion: suggestionText });
 
   } catch (error) {
-    console.error(error);
+    console.error('OpenAI error:', error);
     res.status(500).json({ error: "Failed to generate suggestion" });
   }
 });
 
-
-
 // --------------------
 // Start server
 // --------------------
-app.listen(port, () => {
-  console.log(`✅ Hobby sessions server running on http://localhost:${port}`);
+(async function start() {
+  try {
+    await ensureTables();
+    app.listen(port, () => {
+      console.log(`✅ Hobby sessions server running on http://localhost:${port}`);
 
-  transporter.verify((error, success) => {
-  if (error) {
-    console.error('❌ Email transporter failed:', error);
-  } else {
-    console.log('✅ Email transporter is ready to send messages');
+      transporter.verify((error, success) => {
+        if (error) {
+          console.error('❌ Email transporter failed:', error);
+        } else {
+          console.log('✅ Email transporter is ready to send messages');
+        }
+      });
+    });
+  } catch (err) {
+    console.error('Error during startup:', err);
+    process.exit(1);
   }
-});
-
-});
+})();
